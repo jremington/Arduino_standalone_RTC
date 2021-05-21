@@ -1,0 +1,145 @@
+// low power BCD RTC using bare bones ATMega328p, no regulator, 3-5V
+// update 5/2021
+// ASCII RTC buffer, maintains C-string HH:MM:SS
+//
+// This code creates an RTC formed by Timer2. Requires 32768 Hz xtal + 2x30 pF caps on OSC pins
+// Low power operation borrowed heavily from https://www.gammon.com.au/power
+
+// SET FUSES: 8 MHz internal RC clock
+// S. James Remington 3/2013
+//tested on 8MHz internal clock mini-duino http://www.crossroadsfencing.com/BobuinoRev17/
+
+#include <avr/sleep.h>
+#include <util/delay.h>
+
+// Global variables for RTC
+//                                 0   1       3   4       6   7
+volatile unsigned char RTC_buf[]={'0','0',':','0','0',':','0','0',0}; //hh:mm:ss, with zero terminator
+volatile unsigned int dayno = 0; //days since startup
+
+#define BUF_LEN 20
+char buf[BUF_LEN];  //print message buffer
+
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+  Serial.println("Simple RTC");
+
+  //PRR Power Reduction Register (set PRADC after ADCSRA=0)
+  //Bit 7 - PRTWI: Power Reduction TWI
+  //Bit 6 - PRTIM2: Power Reduction Timer/Counter2
+  //Bit 5 - PRTIM0: Power Reduction Timer/Counter0
+  //Bit 3 - PRTIM1: Power Reduction Timer/Counter1
+  //Bit 2 - PRSPI: Power Reduction Serial Peripheral Interface
+  //Bit 1 - PRUSART0: Power Reduction USART0
+  //Bit 0 - PRADC: Power Reduction ADC
+
+  ADCSRA = 0; //disable ADC
+  // turn off  unneeded modules. 
+  PRR |= (1 << PRTWI) | (1 << PRTIM1) | (1 << PRSPI) | (1 << PRADC); // | (1 << PRUSART0) ;
+
+  // reprogram timer 2 for this application
+
+  timer2_init();
+}
+
+void loop() {
+
+  static char t = 0;  //must be static or global
+
+    // wake up on Timer2 overflow (1/sec)
+    // output day, time and cpu voltage on serial monitor every ... (10 seconds now)
+
+    if (t != RTC_buf[6]) { //have 10 seconds passed?
+
+      t = RTC_buf[6];
+
+/* turn on ADC if needed
+      PRR &= ~((1 << PRADC) | (1 << PRUSART0)); //turn on ADC and USART
+      ADCSRA = (1 << ADEN); //set up ADC properly
+      ADCSRA |= (1 << ADPS0) | (1 << ADPS1) | (1 << ADPS2); // ADC Prescaler=128
+*/
+      //    print day, time
+
+      snprintf(buf, BUF_LEN, "%s/%u", RTC_buf, dayno);
+      Serial.println(buf);
+      Serial.flush(); //finish printing before going to sleep
+
+      // back to sleep with modules off
+
+/* adc back off, if on
+      ADCSRA = 0; //ADC off
+      PRR |= (1 << PRADC) | (1 << PRUSART0);  //turn off ADC and USART
+*/
+    } //end if (t)
+    
+// go back to sleep
+    set_sleep_mode(SLEEP_MODE_PWR_SAVE);
+    sleep_enable();
+    cli(); //time critical steps follow
+    MCUCR = (1 << BODS) | (1 << BODSE); // turn on brown-out enable select
+    MCUCR = (1 << BODS);         //Brown out off. This must be done within 4 clock cycles of above
+    sei();
+    sleep_cpu();
+}
+
+//******************************************************************
+//  Timer2 Interrupt Service
+//  32 kKz / 256 = 1 Hz with Timer2 prescaler 128
+//  provides global tick timer and BCD ASCII Real Time Clock
+//  no check for illegal values of RTC_buffer upon startup!
+
+ISR (TIMER2_OVF_vect) {
+
+// RTC function
+
+    RTC_buf[7]++;    // increment second
+
+     if (RTC_buf[7] > '9')
+    {
+      RTC_buf[7]='0'; // increment ten seconds
+      RTC_buf[6]++;
+      if ( RTC_buf[6] > '5')
+      {
+        RTC_buf[6]='0';
+        RTC_buf[4]++;     // increment minutes
+          if (RTC_buf[4] > '9')
+          {
+          RTC_buf[4]='0';
+          RTC_buf[3]++;   // increment ten minutes
+
+          if (RTC_buf[3] > '5')
+          {
+          RTC_buf[3]='0';
+          RTC_buf[1]++;     // increment hours
+          char b = RTC_buf[0]; // tens of hours, handle rollover at 19 or 23
+            if ( ((b < '2') && (RTC_buf[1] > '9')) || ((b=='2') && (RTC_buf[1] > '3')) )
+              {
+            RTC_buf[1]='0';
+            RTC_buf[0]++;   // increment ten hours and day number, if midnight rollover
+            if (RTC_buf[0] > '2') {RTC_buf[0]='0'; dayno++;}
+              }
+          }
+        }
+      }
+    }
+}
+
+//
+// initialize Timer2 as asynchronous 32768 Hz timing source
+//
+
+void timer2_init(void) {
+
+  TCCR2A = 0;
+  TCCR2B = 0;  //stop Timer 2
+  TIMSK2 = 0; // disable Timer 2 interrupts
+  ASSR = (1 << AS2); // select asynchronous operation of Timer2
+  TCNT2 = 0; // clear Timer 2 counter
+  TCCR2B = (1 << CS22) | (1 << CS20); // select prescaler 128 => 1 sec between each overflow
+
+  while (ASSR & ((1 << TCN2UB) | (1 << TCR2BUB))); // wait for TCN2UB and TCR2BUB to be cleared
+
+  TIFR2 = (1 << TOV2); // clear interrupt-flag
+  TIMSK2 = (1 << TOIE2); // enable Timer2 overflow interrupt
+}
